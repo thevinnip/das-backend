@@ -106,7 +106,7 @@ app.post("/process-cnpjs", async (req: Request, res: Response): Promise<any> => 
 });
 
 app.get("/task/:taskId", (req: Request, res: Response): any => {
-    const task = tasks.get(req.params.taskId);
+    const task = tasks.get(req.params.taskId as string);
     if (!task) {
         return res.status(404).json({ error: "Task não encontrada" });
     }
@@ -114,7 +114,7 @@ app.get("/task/:taskId", (req: Request, res: Response): any => {
 });
 
 app.get("/download/:taskId", async (req: Request, res: Response): Promise<any> => {
-    const task = tasks.get(req.params.taskId);
+    const task = tasks.get(req.params.taskId as string);
     if (!task) {
         return res.status(404).json({ error: "Task não encontrada" });
     }
@@ -231,7 +231,7 @@ async function processCnpjs(cnpjList: string[], referenceDate: Date, taskId: str
                 await delay(1000);
             }
 
-            resolve(captchaTokens.shift());
+            resolve(captchaTokens.shift() as string);
         });
     }
 
