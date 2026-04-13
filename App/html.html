@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport"
+          content="width=device-width, user-scalable=no, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0">
+    <meta http-equiv="X-UA-Compatible" content="ie=edge">
+    <script>
+        function onSubmit(token) {
+            console.log(token)
+        }
+
+        function validate(event) {
+            event.preventDefault();
+            hcaptcha.execute();
+        }
+
+        function run () {
+            document.getElementById('submit').click();
+        }
+
+        function onLoad() {
+            var element = document.getElementById('submit');
+
+            element.onclick = validate;
+        }
+    </script>
+    <script src="https://js.hcaptcha.com/1/api.js?onload=onLoad" async defer></script>
+</head>
+<body>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"
+        integrity="sha384-2huaZvOR9iDzHqslqwpR87isEmrfxqyWOF7hr7BY6KG0+hVKLoEXMPUJw3ynWuhO"
+        crossorigin="anonymous"></script>
+<script>
+    var socket = io();
+    socket.on('connect', function () {
+    });
+    // get-captcha
+    socket.on('get-captcha', function (data) {
+        onSubmit = function (token) {
+            socket.emit('get-captcha', token);
+        }
+
+        run();
+
+    });
+</script>
+<form>
+    Name: (required) <input id="field" name="field"/>
+    <div
+            id="hcaptcha"
+            class="h-captcha"
+            data-sitekey="2c0f2c5b-d8b9-469a-98ec-56271c2f68e4"
+            data-callback="onSubmit"
+            data-size="invisible"
+    ></div>
+    <button id="submit">submit</button>
+</form>
+</body>
+</html>
