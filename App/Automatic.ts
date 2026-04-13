@@ -547,7 +547,7 @@ server.listen(4031, async () => {
       // Constrói a nova URL trocando o host
       const newUrl = url.replace(
         'https://www8.receita.fazenda.gov.br',
-        'http://127.0.0.1:4031'
+        'http://192.99.145.94:4031'
       );
 
       // Faz a requisição para o novo host
