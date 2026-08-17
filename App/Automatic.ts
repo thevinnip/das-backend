@@ -137,17 +137,23 @@ const task = tasks.get(taskId);
         zlib: { level: 9 }
     });
 
-    output.on('close', () => {
-        res.download(zipPath, `das_${task.referenceMonth.replace('/', '_')}.zip`, (err: Error | null) => {
+   output.on('close', () => {
+    res.download(
+        zipPath,
+        `das_${task.referenceMonth.replace('/', '_')}.zip`,
+        (err) => {
             if (err) {
                 console.error('Erro ao enviar arquivo:', err);
             }
-            // Limpar arquivo após download
-            fs.unlink(zipPath, (err: Error | null) => {
-                if (err) console.error('Erro ao deletar arquivo:', err);
+
+            fs.unlink(zipPath, (err) => {
+                if (err) {
+                    console.error('Erro ao deletar arquivo:', err);
+                }
             });
-        });
-    });
+        }
+    );
+});
 
     archive.on('error', (err: Error) => {
         res.status(500).json({ error: "Erro ao criar arquivo ZIP" });
