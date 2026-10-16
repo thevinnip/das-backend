@@ -25,9 +25,14 @@ const io = new Server(server, {
     }
 });
 
+const FRONTEND_ORIGINS = (process.env.FRONTEND_ORIGIN ?? "http://localhost:3000")
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+
 // Configuração do CORS
 app.use(cors({
-    origin: "http://localhost:3000",
+    origin: FRONTEND_ORIGINS,
     methods: ["GET", "POST"],
     credentials: true
 }));
