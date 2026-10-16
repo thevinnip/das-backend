@@ -5,6 +5,7 @@ import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import axios from "axios";
 import {load} from "cheerio";
 import * as fs from "node:fs";
+import zlib from "node:zlib";
 import {wrapper} from "axios-cookiejar-support";
 import {CookieJar} from "tough-cookie";
 import {Browser} from "puppeteer";
@@ -204,6 +205,103 @@ function sanitizeFileName(fileName: string): string {
         .replace(/^_|_$/g, ''); // Remove underscores do início e fim
 }
 
+async function readResponseBody(data: unknown): Promise<Buffer> {
+    if (Buffer.isBuffer(data)) {
+        return data;
+    }
+
+    if (data instanceof ArrayBuffer) {
+        return Buffer.from(data);
+    }
+
+    if (ArrayBuffer.isView(data)) {
+        return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+    }
+
+    if (typeof data === "string") {
+        return Buffer.from(data, "latin1");
+    }
+
+    if (data && typeof (data as AsyncIterable<unknown>)[Symbol.asyncIterator] === "function") {
+        const chunks: Buffer[] = [];
+        for await (const chunk of data as AsyncIterable<unknown>) {
+            if (Buffer.isBuffer(chunk)) {
+                chunks.push(chunk);
+            } else if (chunk instanceof ArrayBuffer) {
+                chunks.push(Buffer.from(chunk));
+            } else if (ArrayBuffer.isView(chunk)) {
+                chunks.push(Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+            } else if (typeof chunk === "string") {
+                chunks.push(Buffer.from(chunk, "latin1"));
+            } else {
+                throw new Error("Trecho do PDF em formato inesperado");
+            }
+        }
+        return Buffer.concat(chunks);
+    }
+
+    throw new Error("Resposta do PDF em formato inesperado");
+}
+
+function isTrailingJunk(tail: Buffer): boolean {
+    if (tail.length === 0) return false;
+    for (const byte of tail) {
+        if (byte !== 0 && byte !== 9 && byte !== 10 && byte !== 13 && byte !== 32) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function normalizePdfBuffer(input: Buffer): Buffer | null {
+    let buffer = input;
+
+    if (buffer.length >= 2 && buffer[0] === 0x1f && buffer[1] === 0x8b) {
+        try {
+            buffer = zlib.gunzipSync(buffer);
+        } catch {
+            return null;
+        }
+    }
+
+    const head = buffer.subarray(0, 32).toString("utf8").trimStart();
+    if (head.startsWith("JVBERi0")) {
+        try {
+            const decoded = Buffer.from(buffer.toString("utf8").replace(/\s/g, ""), "base64");
+            if (decoded.subarray(0, 5).toString("latin1") !== "%PDF-") {
+                return null;
+            }
+            buffer = decoded;
+        } catch {
+            return null;
+        }
+    }
+
+    const marker = buffer.indexOf("%PDF-");
+    if (marker < 0 || marker > 512) {
+        return null;
+    }
+    if (marker > 0) {
+        buffer = buffer.subarray(marker);
+    }
+
+    const eof = buffer.lastIndexOf("%%EOF");
+    if (eof !== -1) {
+        let end = eof + 5;
+        if (buffer[end] === 0x0d) end += 1;
+        if (buffer[end] === 0x0a) end += 1;
+        if (isTrailingJunk(buffer.subarray(end))) {
+            buffer = buffer.subarray(0, end);
+        }
+    }
+
+    if (buffer.subarray(0, 5).toString("latin1") !== "%PDF-") {
+        return null;
+    }
+
+    return buffer;
+}
+
 async function processCnpjs(cnpjList: string[], referenceDate: Date, taskId: string) {
     console.log(cnpjList)
     const task = tasks.get(taskId);
@@ -259,7 +357,7 @@ resolve(token);
         axios.create({
             headers: {
                 "Priority": "u=0, i",
-                "Accept-Encoding": "gzip, deflate, br, zstd",
+                "Accept-Encoding": "gzip, deflate, br",
                 // "Referer": "https://www.google.com/",
                 "Sec-Fetch-Dest": "document",
                 "Sec-Fetch-User": "?1",
@@ -306,13 +404,18 @@ resolve(token);
         }
 
         try {
+            if (progressIndex !== -1) {
+                task.progress[progressIndex].status = 'processing';
+                tasks.set(taskId, task);
+            }
+
             const r1 = await client.get('https://www8.receita.fazenda.gov.br/SimplesNacional/Aplicacoes/ATSPO/pgmei.app/Identificacao')
             // <input name="__RequestVerificationToken" type="hidden" value="Rwe2GSpDmtOGzHyThqeekFSPRxVXzwNmuFfjX3T98qGIRDH_pH_iREogM1UyxCzL6562HSiV3xM-M4oWDIiBQ_JZ1T6rf0cXBDA8ar7YAtw1">
             const loginRequestVerificationToken = r1.data.split('name="__RequestVerificationToken" type="hidden" value="')[1].split('"')[0];
 
             const r2 = await client.post('https://www8.receita.fazenda.gov.br/SimplesNacional/Aplicacoes/ATSPO/pgmei.app/Identificacao/Continuar', new URLSearchParams({
                 __RequestVerificationToken: loginRequestVerificationToken,
-                cnpj: numberedCNPJ.replace(/(d{2})(d{3})(d{3})(d{4})(d{2})/, "$1.$2.$3/$4-$5"),
+                cnpj: numberedCNPJ.replace(/^(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})$/, "$1.$2.$3/$4-$5"),
                 "h-captcha-response": await getCaptcha()
             }).toString(), {
                 headers: {
@@ -418,23 +521,44 @@ resolve(token);
                 }
             } else {
                 const pdfFile = await client.get("https://www8.receita.fazenda.gov.br/SimplesNacional/Aplicacoes/ATSPO/pgmei.app/emissao/imprimir", {
-                    headers: {},
-                    responseType: 'arraybuffer',
+                    responseType: "stream",
+                    decompress: true,
+                    timeout: 60000,
+                    headers: {
+                        Accept: "application/pdf,application/octet-stream,*/*;q=0.8",
+                        "Accept-Encoding": "identity",
+                        Referer: "https://www8.receita.fazenda.gov.br/SimplesNacional/Aplicacoes/ATSPO/pgmei.app/emissao",
+                    },
                 });
 
-                const sanitizedName = sanitizeFileName(nome);
-                const fileName = `${sanitizedName}_${numberedCNPJ}.pdf`;
-                const filePath = path.join(__dirname, 'das', fileName);
-                console.log(filePath)
-                
-                fs.writeFileSync(filePath, pdfFile.data);
-                fs.appendFileSync("files/done.txt", `${cnpj}\n`);
-                console.log(`[SUCESSO] DAS gerado para o CNPJ ${cnpj} no mês ${fullMonth}/${fullYear} (${((Date.now() - start) / 1000).toFixed(1)}s)`.green);
-                
-                if (progressIndex !== -1) {
-                    task.progress[progressIndex].status = 'completed';
-                    task.progress[progressIndex].nome = nome;
-                    task.totalSuccess++;
+                const rawPdf = await readResponseBody(pdfFile.data);
+                const pdfBuffer = normalizePdfBuffer(rawPdf);
+
+                if (!pdfBuffer) {
+                    console.log(`[ERRO] CNPJ ${cnpj} retornou um PDF inválido. inicio=${rawPdf.subarray(0, 16).toString("hex")} (${((Date.now() - start) / 1000).toFixed(1)}s)`.red);
+                    fs.appendFileSync("files/error.txt", `${cnpj} - PDF inválido\n`);
+
+                    if (progressIndex !== -1) {
+                        task.progress[progressIndex].status = 'error';
+                        task.progress[progressIndex].error = 'PDF inválido retornado pela Receita';
+                        task.progress[progressIndex].nome = nome;
+                        task.totalError++;
+                    }
+                } else {
+                    const sanitizedName = sanitizeFileName(nome);
+                    const fileName = `${sanitizedName}_${numberedCNPJ}.pdf`;
+                    const filePath = path.join(__dirname, 'das', fileName);
+                    console.log(filePath);
+
+                    fs.writeFileSync(filePath, pdfBuffer);
+                    fs.appendFileSync("files/done.txt", `${cnpj}\n`);
+                    console.log(`[SUCESSO] DAS gerado para o CNPJ ${cnpj} no mês ${fullMonth}/${fullYear} (${((Date.now() - start) / 1000).toFixed(1)}s)`.green);
+
+                    if (progressIndex !== -1) {
+                        task.progress[progressIndex].status = 'completed';
+                        task.progress[progressIndex].nome = nome;
+                        task.totalSuccess++;
+                    }
                 }
             }
 
