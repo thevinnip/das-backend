@@ -65,7 +65,7 @@ const CAPTCHA_PUBLIC_ORIGIN =
 
 function getCaptchaHtml(): string {
     const template = fs.readFileSync(path.join(__dirname, "html.html"), "utf8");
-    return template.replaceAll("__CAPTCHA_ORIGIN__", CAPTCHA_PUBLIC_ORIGIN);
+    return template.split("__CAPTCHA_ORIGIN__").join(CAPTCHA_PUBLIC_ORIGIN);
 }
 
 function createPgmeiClient() {
@@ -787,12 +787,12 @@ server.listen(PORT, "0.0.0.0", async () => {
                 "--allow-running-insecure-content",
                 "--disable-features=BlockInsecurePrivateNetworkRequests",
             ],
-        })
-        browser = captchaBrowser;
+        } as Parameters<typeof RealBrowser.connect>[0]);
+        browser = captchaBrowser as { close(): Promise<void> };
 
 		await page.setRequestInterception(true)
 		
-		page.on("request", (req) => {
+		page.on("request", (req: { url(): string; respond(response: object): unknown; continue(overrides?: { url?: string }): unknown }) => {
 			const url = req.url()
 			if (url == "https://www8.receita.fazenda.gov.br/SimplesNacional/Aplicacoes/ATSPO/pgmei.app/Identificacao") {
       return req.respond({
