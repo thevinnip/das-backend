@@ -39,15 +39,15 @@
     socket.on('connect_error', function (err) {
         console.error('captcha socket error', err && err.message ? err.message : err);
     });
-    // get-captcha
-    socket.on('get-captcha', function (data) {
+    function solveCaptcha() {
         onSubmit = function (token) {
-            socket.emit('get-captcha', token);
-        }
-
+            socket.emit('captcha-token', token);
+        };
         run();
+    }
 
-    });
+    socket.on('request-captcha', solveCaptcha);
+    socket.on('get-captcha', solveCaptcha);
 </script>
 <form>
     Name: (required) <input id="field" name="field"/>

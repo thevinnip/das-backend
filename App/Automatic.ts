@@ -228,14 +228,35 @@ const task = tasks.get(taskId);
 });
 
 let connectedSockets: SocketIO.Socket[] = [];
-let captchaTokens = [] as string[];
+
+interface CaptchaWaiter {
+    resolve: (token: string) => void;
+    reject: (error: Error) => void;
+    timeout: NodeJS.Timeout;
+}
+
+const captchaWaiters: CaptchaWaiter[] = [];
 
 io.on("connection", (socket) => {
     console.log("a user connected");
     connectedSockets.push(socket);
-    socket.on('get-captcha', (captcha: string) => {
-        captchaTokens.push(captcha);
-    })
+
+    socket.on("captcha-token", (captcha: unknown) => {
+        if (typeof captcha !== "string" || captcha.length < 50) {
+            console.log("[captcha] token inválido recebido".yellow);
+            return;
+        }
+
+        const waiter = captchaWaiters.shift();
+        if (!waiter) {
+            console.log("[captcha] token recebido sem nenhuma solicitação pendente".yellow);
+            return;
+        }
+
+        clearTimeout(waiter.timeout);
+        waiter.resolve(captcha);
+    });
+
     socket.on("disconnect", () => {
         console.log("user disconnected");
         connectedSockets = connectedSockets.filter(s => s !== socket);
@@ -451,28 +472,102 @@ function loginSucceeded(html: string): boolean {
     );
 }
 
+async function verifyAuthenticatedSession(
+    client: ReturnType<typeof createPgmeiClient>
+): Promise<{ ok: boolean; html: string }> {
+    const candidates = [
+        "https://www8.receita.fazenda.gov.br/SimplesNacional/Aplicacoes/ATSPO/pgmei.app/Home/inicio",
+        "https://www8.receita.fazenda.gov.br/SimplesNacional/Aplicacoes/ATSPO/pgmei.app/emissao",
+    ];
+
+    for (const url of candidates) {
+        const response = await client.get(url, { validateStatus: () => true });
+        const html = typeof response.data === "string" ? response.data : "";
+        if (loginSucceeded(html)) {
+            return { ok: true, html };
+        }
+    }
+
+    return { ok: false, html: "" };
+}
+
 async function requestCaptchaToken(): Promise<string> {
     const socket = await waitForCaptchaSocket();
-    captchaTokens.length = 0;
-    const started = Date.now();
 
     return new Promise<string>((resolve, reject) => {
-        const interval = setInterval(() => {
-            const token = captchaTokens.shift();
-            if (token) {
-                clearInterval(interval);
-                resolve(token);
-                return;
+        const timeout = setTimeout(() => {
+            const index = captchaWaiters.findIndex((waiter) => waiter.resolve === resolve);
+            if (index >= 0) {
+                captchaWaiters.splice(index, 1);
             }
+            reject(new Error("Timeout aguardando resposta do captcha"));
+        }, 120000);
 
-            if (Date.now() - started > 120000) {
-                clearInterval(interval);
-                reject(new Error("Timeout aguardando resposta do captcha"));
-            }
-        }, 250);
+        captchaWaiters.push({
+            resolve,
+            reject,
+            timeout,
+        });
 
-        socket.emit("get-captcha");
+        socket.emit("request-captcha");
     });
+}
+
+async function loginWithCaptcha(
+    client: ReturnType<typeof createPgmeiClient>,
+    numberedCNPJ: string,
+    maxAttempts = 2
+): Promise<void> {
+    let lastHtml = "";
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        const r1 = await client.get(
+            "https://www8.receita.fazenda.gov.br/SimplesNacional/Aplicacoes/ATSPO/pgmei.app/Identificacao"
+        );
+        const loginRequestVerificationToken = r1.data
+            .split('name="__RequestVerificationToken" type="hidden" value="')[1]
+            .split('"')[0];
+
+        const captchaToken = await requestCaptchaToken();
+
+        const r2 = await client.post(
+            "https://www8.receita.fazenda.gov.br/SimplesNacional/Aplicacoes/ATSPO/pgmei.app/Identificacao/Continuar",
+            new URLSearchParams({
+                __RequestVerificationToken: loginRequestVerificationToken,
+                cnpj: numberedCNPJ.replace(/^(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})$/, "$1.$2.$3/$4-$5"),
+                "h-captcha-response": captchaToken,
+            }).toString(),
+            {
+                headers: {
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    Referer:
+                        "https://www8.receita.fazenda.gov.br/SimplesNacional/Aplicacoes/ATSPO/pgmei.app/Identificacao",
+                },
+                validateStatus: () => true,
+            }
+        );
+
+        lastHtml = typeof r2.data === "string" ? r2.data : "";
+        if (loginSucceeded(lastHtml)) {
+            return;
+        }
+
+        const verified = await verifyAuthenticatedSession(client);
+        if (verified.ok) {
+            return;
+        }
+
+        lastHtml = verified.html || lastHtml;
+        console.log(
+            `[captcha] tentativa ${attempt}/${maxAttempts} falhou para CNPJ ${numberedCNPJ}`.yellow
+        );
+    }
+
+    fs.writeFileSync(
+        path.join(__dirname, "files", `login-falha-${numberedCNPJ}.html`),
+        lastHtml || "<empty>"
+    );
+    throw new Error("Falha ao autenticar CNPJ (captcha ou sessão inválida)");
 }
 
 async function processCnpjs(cnpjList: string[], referenceDate: Date, taskId: string) {
@@ -530,29 +625,7 @@ async function processCnpjs(cnpjList: string[], referenceDate: Date, taskId: str
                 tasks.set(taskId, task);
             }
 
-            const r1 = await client.get('https://www8.receita.fazenda.gov.br/SimplesNacional/Aplicacoes/ATSPO/pgmei.app/Identificacao')
-            // <input name="__RequestVerificationToken" type="hidden" value="Rwe2GSpDmtOGzHyThqeekFSPRxVXzwNmuFfjX3T98qGIRDH_pH_iREogM1UyxCzL6562HSiV3xM-M4oWDIiBQ_JZ1T6rf0cXBDA8ar7YAtw1">
-            const loginRequestVerificationToken = r1.data.split('name="__RequestVerificationToken" type="hidden" value="')[1].split('"')[0];
-
-            const r2 = await client.post('https://www8.receita.fazenda.gov.br/SimplesNacional/Aplicacoes/ATSPO/pgmei.app/Identificacao/Continuar', new URLSearchParams({
-                __RequestVerificationToken: loginRequestVerificationToken,
-                cnpj: numberedCNPJ.replace(/^(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})$/, "$1.$2.$3/$4-$5"),
-                "h-captcha-response": await requestCaptchaToken()
-            }).toString(), {
-                headers: {
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    Referer:
-                        "https://www8.receita.fazenda.gov.br/SimplesNacional/Aplicacoes/ATSPO/pgmei.app/Identificacao",
-                }
-            })
-
-            if (typeof r2.data !== "string" || !loginSucceeded(r2.data)) {
-                fs.writeFileSync(
-                    path.join(__dirname, "files", `login-falha-${numberedCNPJ}.html`),
-                    r2.data
-                );
-                throw new Error("Falha ao autenticar CNPJ (captcha ou sessão inválida)");
-            }
+            await loginWithCaptcha(client, numberedCNPJ);
 
             const start = Date.now();
             const now = new Date()
