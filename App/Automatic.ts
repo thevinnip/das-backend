@@ -62,8 +62,47 @@ interface Task {
 
 const tasks: Map<string, Task> = new Map();
 
+const PORT = Number(process.env.PORT ?? 4031);
+const CAPTCHA_PUBLIC_ORIGIN =
+    process.env.CAPTCHA_PUBLIC_ORIGIN ?? `http://127.0.0.1:${PORT}`;
+
+function getCaptchaHtml(): string {
+    const template = fs.readFileSync(path.join(__dirname, "html.html"), "utf8");
+    return template.replaceAll("__CAPTCHA_ORIGIN__", CAPTCHA_PUBLIC_ORIGIN);
+}
+
+function createPgmeiClient() {
+    return wrapper(
+        axios.create({
+            headers: {
+                Priority: "u=0, i",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-User": "?1",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "cross-site",
+                "Accept-Language": "pt-BR,pt;q=0.9",
+                "Sec-Gpc": "1",
+                "User-Agent":
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+                "Upgrade-Insecure-Requests": "1",
+                "Sec-Ch-Ua-Platform": '"Windows"',
+                "Sec-Ch-Ua-Mobile": "?0",
+                "Sec-Ch-Ua": '"Brave";v="129", "Not=A?Brand";v="8", "Chromium";v="129"',
+                Connection: "keep-alive",
+                "X-Real-Ip": "177.10.117.235",
+                Host: "www8.receita.fazenda.gov.br",
+                Origin: "https://www8.receita.fazenda.gov.br",
+            },
+            jar: new CookieJar(),
+            withCredentials: true,
+            maxRedirects: 5,
+        })
+    );
+}
+
 app.get("/", async (req, res) => {
-    res.sendFile(__dirname + "/html.html");
+    res.type("html").send(getCaptchaHtml());
 });
 
 app.post("/process-cnpjs", async (req: Request, res: Response): Promise<any> => {
@@ -175,7 +214,12 @@ const task = tasks.get(taskId);
     });
 
     for (const file of taskFiles) {
-        archive.file(path.join(dasDir, file), { name: file });
+        const filePath = path.join(dasDir, file);
+        const header = fs.readFileSync(filePath).subarray(0, 5).toString("latin1");
+        if (header !== "%PDF-") {
+            continue;
+        }
+        archive.file(filePath, { name: file });
     }
 
     await archive.finalize();
@@ -302,6 +346,133 @@ function normalizePdfBuffer(input: Buffer): Buffer | null {
     return buffer;
 }
 
+function absolutePgmeiUrl(action: string): string {
+    if (action.startsWith("http")) return action;
+    const base = "https://www8.receita.fazenda.gov.br/SimplesNacional/Aplicacoes/ATSPO/pgmei.app";
+    return action.startsWith("/")
+        ? `https://www8.receita.fazenda.gov.br${action}`
+        : `${base}/${action.replace(/^\//, "")}`;
+}
+
+async function fetchDasPdf(
+    client: ReturnType<typeof createPgmeiClient>,
+    dasGenerationHtml: string
+): Promise<Buffer | null> {
+    const $ = load(dasGenerationHtml);
+    const printForm = $('form[action*="imprimir"]').first();
+    const referer =
+        "https://www8.receita.fazenda.gov.br/SimplesNacional/Aplicacoes/ATSPO/pgmei.app/emissao/gerarDas";
+    const pdfHeaders = {
+        Accept: "application/pdf,application/octet-stream,*/*;q=0.8",
+        "Accept-Encoding": "identity",
+        Referer: referer,
+    };
+
+    const attempts: Array<() => Promise<Buffer>> = [];
+
+    if (printForm.length) {
+        const action = printForm.attr("action");
+        if (action) {
+            const url = absolutePgmeiUrl(action);
+            const body = new URLSearchParams();
+            printForm.find("input").each((_, element) => {
+                const name = $(element).attr("name");
+                if (!name) return;
+                body.append(name, $(element).attr("value") ?? "");
+            });
+            attempts.push(async () =>
+                readResponseBody(
+                    (
+                        await client.post(url, body.toString(), {
+                            responseType: "stream",
+                            decompress: true,
+                            timeout: 60000,
+                            headers: {
+                                ...pdfHeaders,
+                                "Content-Type": "application/x-www-form-urlencoded",
+                            },
+                        })
+                    ).data
+                )
+            );
+        }
+    }
+
+    attempts.push(async () =>
+        readResponseBody(
+            (
+                await client.get(
+                    "https://www8.receita.fazenda.gov.br/SimplesNacional/Aplicacoes/ATSPO/pgmei.app/emissao/imprimir",
+                    {
+                        responseType: "stream",
+                        decompress: true,
+                        timeout: 60000,
+                        headers: pdfHeaders,
+                    }
+                )
+            ).data
+        )
+    );
+
+    for (const attempt of attempts) {
+        try {
+            const rawPdf = await attempt();
+            const pdfBuffer = normalizePdfBuffer(rawPdf);
+            if (pdfBuffer) return pdfBuffer;
+        } catch {
+            // tenta o próximo método
+        }
+    }
+
+    return null;
+}
+
+async function waitForCaptchaSocket(timeoutMs = 120000): Promise<SocketIO.Socket> {
+    const started = Date.now();
+    while (connectedSockets.length === 0) {
+        if (Date.now() - started > timeoutMs) {
+            throw new Error(
+                "Navegador do captcha não conectou. Verifique se a janela do Chrome abriu e se CAPTCHA_PUBLIC_ORIGIN está correto."
+            );
+        }
+        await delay(500);
+    }
+
+    return connectedSockets[connectedSockets.length - 1];
+}
+
+function loginSucceeded(html: string): boolean {
+    return (
+        html.includes("<strong>CNPJ:</strong>") ||
+        html.includes("/pgmei.app/Home/inicio") ||
+        html.includes("/pgmei.app/emissao")
+    );
+}
+
+async function requestCaptchaToken(): Promise<string> {
+    const socket = await waitForCaptchaSocket();
+    captchaTokens.length = 0;
+    const started = Date.now();
+
+    return new Promise<string>((resolve, reject) => {
+        const interval = setInterval(() => {
+            const token = captchaTokens.shift();
+            if (token) {
+                clearInterval(interval);
+                resolve(token);
+                return;
+            }
+
+            if (Date.now() - started > 120000) {
+                clearInterval(interval);
+                reject(new Error("Timeout aguardando resposta do captcha"));
+            }
+        }, 250);
+
+        socket.emit("get-captcha");
+    });
+}
+
 async function processCnpjs(cnpjList: string[], referenceDate: Date, taskId: string) {
     console.log(cnpjList)
     const task = tasks.get(taskId);
@@ -331,60 +502,8 @@ async function processCnpjs(cnpjList: string[], referenceDate: Date, taskId: str
 
     console.log(`Iniciando processamento de ${cnpjList.length} CNPJs`.blue)
 
-    let lastIndex = 0;
-
-    const getCaptcha = async () => {
-        const availableSockets = connectedSockets[0];
-
-        return new Promise<string>(async (resolve) => {
-            availableSockets.emit("get-captcha");
-
-            while (captchaTokens?.length === 0) {
-                await delay(1000);
-            }
-
-            const token = captchaTokens.shift();
-
-if (!token) {
-  throw new Error("Sem tokens disponíveis");
-}
-
-resolve(token);
-        });
-    }
-
-    const client = wrapper(
-        axios.create({
-            headers: {
-                "Priority": "u=0, i",
-                "Accept-Encoding": "gzip, deflate, br",
-                // "Referer": "https://www.google.com/",
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-User": "?1",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "cross-site",
-                "Accept-Language": "pt-BR,pt;q=0.9",
-                "Sec-Gpc": "1",
-                // "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
-                "Upgrade-Insecure-Requests": "1",
-                "Sec-Ch-Ua-Platform": "\"Windows\"",
-                "Sec-Ch-Ua-Mobile": "?0",
-                "Sec-Ch-Ua": "\"Brave\";v=\"129\", \"Not=A?Brand\";v=\"8\", \"Chromium\";v=\"129\"",
-                "Connection": "keep-alive",
-                // "X-Accel-Internal": "/internal-nginx-static-location",
-                "X-Real-Ip": "177.10.117.235",
-                "Host": "www8.receita.fazenda.gov.br",
-                "Origin": "https://www8.receita.fazenda.gov.br",
-                "Authorization": "",
-                "Mod-Rewrite": "On"
-            },
-            jar: new CookieJar(),
-            withCredentials: true
-        })
-    )
-
     for (const cnpj of cnpjList) {
+        const client = createPgmeiClient();
         const numberedCNPJ = cnpj.replace(/\D/g, '');
         const progressIndex = task.progress.findIndex(p => p.cnpj === cnpj);
         
@@ -416,32 +535,47 @@ resolve(token);
             const r2 = await client.post('https://www8.receita.fazenda.gov.br/SimplesNacional/Aplicacoes/ATSPO/pgmei.app/Identificacao/Continuar', new URLSearchParams({
                 __RequestVerificationToken: loginRequestVerificationToken,
                 cnpj: numberedCNPJ.replace(/^(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})$/, "$1.$2.$3/$4-$5"),
-                "h-captcha-response": await getCaptcha()
+                "h-captcha-response": await requestCaptchaToken()
             }).toString(), {
                 headers: {
-                    "Content-Type": "application/x-www-form-urlencoded"
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    Referer:
+                        "https://www8.receita.fazenda.gov.br/SimplesNacional/Aplicacoes/ATSPO/pgmei.app/Identificacao",
                 }
             })
 
-            // console.log(r2.data)
+            if (typeof r2.data !== "string" || !loginSucceeded(r2.data)) {
+                fs.writeFileSync(
+                    path.join(__dirname, "files", `login-falha-${numberedCNPJ}.html`),
+                    r2.data
+                );
+                throw new Error("Falha ao autenticar CNPJ (captcha ou sessão inválida)");
+            }
 
             const start = Date.now();
             const now = new Date()
             const lastMonth = referenceDate
-
-            const emissionResponse = await client.post("https://www8.receita.fazenda.gov.br/SimplesNacional/Aplicacoes/ATSPO/pgmei.app/emissao", {
-                "ano": lastMonth.getFullYear()
-            }, {
-                headers: {
-                    // "cookie": (await page.cookies()).map(cookie => `${cookie.name}=${cookie.value}`).join('; '),
-                    "Referer": "https://www8.receita.fazenda.gov.br/SimplesNacional/Aplicacoes/ATSPO/pgmei.app/emissao",
-                    "Referrer-Policy": "strict-origin-when-cross-origin"
-                }
-            });
-
-            fs.writeFileSync('emission.html', emissionResponse.data)
-
             const fullYear = lastMonth.getFullYear();
+
+            const emissionResponse = await client.post(
+                "https://www8.receita.fazenda.gov.br/SimplesNacional/Aplicacoes/ATSPO/pgmei.app/emissao",
+                new URLSearchParams({ ano: String(fullYear) }).toString(),
+                {
+                    headers: {
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        Referer:
+                            "https://www8.receita.fazenda.gov.br/SimplesNacional/Aplicacoes/ATSPO/pgmei.app/emissao",
+                    },
+                }
+            );
+
+            if (
+                typeof emissionResponse.data === "string" &&
+                emissionResponse.data.includes("Informe o Ano-Calendário")
+            ) {
+                throw new Error("Não foi possível abrir a emissão do DAS para o ano informado");
+            }
+
             const fullMonth = (lastMonth.getMonth() + 1).toString().padStart(2, '0');
             const fullDay = lastMonth.getDate().toString().padStart(2, '0');
 
@@ -449,10 +583,13 @@ resolve(token);
             const nowFullMonth = (now.getMonth() + 1).toString().padStart(2, '0');
             const nowFullDay = now.getDate().toString().padStart(2, '0');
 
-            fs.writeFileSync("emission.txt", emissionResponse.data)
-
             const requestVerificationToken = emissionResponse.data.split('name="__RequestVerificationToken" type="hidden" value="')[1]?.split('"')[0];
-            const nome = emissionResponse.data.split('<li><strong>Nome:</strong> ')[1].split('<')[0].replace(/\d/g, '').trim();
+            const nomeMatch = emissionResponse.data.match(/<strong>Nome:<\/strong>\s*([^<]+)/);
+            const nome = (nomeMatch?.[1] ?? "").replace(/\d/g, "").trim();
+
+            if (!requestVerificationToken || !nome) {
+                throw new Error("Resposta de emissão inválida da Receita Federal");
+            }
 
             const pa = `${fullYear}${fullMonth}`;
             const dataConsolidacao = `${nowFullDay}/${nowFullMonth}/${nowFullYear}`;
@@ -481,8 +618,9 @@ resolve(token);
                 `__RequestVerificationToken=${requestVerificationToken}&pa=${pa}&dataConsolidacao=${dataConsolidacao}&ano=${fullYear}`,
                 {
                     headers: {
-                        // cookie: (await page.cookies()).map(cookie => `${cookie.name}=${cookie.value}`).join('; '),
-                        'Content-Type': 'application/x-www-form-urlencoded',
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        Referer:
+                            "https://www8.receita.fazenda.gov.br/SimplesNacional/Aplicacoes/ATSPO/pgmei.app/emissao",
                     },
                 },
             ).catch((error: any): null => {
@@ -520,22 +658,10 @@ resolve(token);
                     task.totalError++;
                 }
             } else {
-                const pdfFile = await client.get("https://www8.receita.fazenda.gov.br/SimplesNacional/Aplicacoes/ATSPO/pgmei.app/emissao/imprimir", {
-                    responseType: "stream",
-                    decompress: true,
-                    timeout: 60000,
-                    headers: {
-                        Accept: "application/pdf,application/octet-stream,*/*;q=0.8",
-                        "Accept-Encoding": "identity",
-                        Referer: "https://www8.receita.fazenda.gov.br/SimplesNacional/Aplicacoes/ATSPO/pgmei.app/emissao",
-                    },
-                });
-
-                const rawPdf = await readResponseBody(pdfFile.data);
-                const pdfBuffer = normalizePdfBuffer(rawPdf);
+                const pdfBuffer = await fetchDasPdf(client, dasGenerationResponse.data);
 
                 if (!pdfBuffer) {
-                    console.log(`[ERRO] CNPJ ${cnpj} retornou um PDF inválido. inicio=${rawPdf.subarray(0, 16).toString("hex")} (${((Date.now() - start) / 1000).toFixed(1)}s)`.red);
+                    console.log(`[ERRO] CNPJ ${cnpj} retornou um PDF inválido (${((Date.now() - start) / 1000).toFixed(1)}s)`.red);
                     fs.appendFileSync("files/error.txt", `${cnpj} - PDF inválido\n`);
 
                     if (progressIndex !== -1) {
@@ -565,7 +691,10 @@ resolve(token);
             task.totalProcessed++;
             tasks.set(taskId, task);
 
-            await axios.get('https://www8.receita.fazenda.gov.br/SimplesNacional/Aplicacoes/ATSPO/pgmei.app/home/sair')
+            await client.get(
+                "https://www8.receita.fazenda.gov.br/SimplesNacional/Aplicacoes/ATSPO/pgmei.app/home/sair",
+                { validateStatus: () => true }
+            );
 
             // se o index for divisivel por 5, aguardar 5 segundos
             if (cnpjList.indexOf(cnpj) % 5 === 0 && cnpjList.indexOf(cnpj) !== 0) {
@@ -644,8 +773,9 @@ function validarCNPJ(cnpj: string): boolean {
     return true;
 }
 
-server.listen(4031, async () => {
-    console.log("Servidor rodando na porta 4031");
+server.listen(PORT, "0.0.0.0", async () => {
+    console.log(`Servidor rodando na porta ${PORT}`);
+    console.log(`Captcha socket em ${CAPTCHA_PUBLIC_ORIGIN}`.cyan);
     
     // Criar pasta zips se não existir
     if (!fs.existsSync("zips")) {
@@ -653,39 +783,35 @@ server.listen(4031, async () => {
     }
     
     try {
-        const { page, browser } = await RealBrowser.connect({
-            headless: false
+        const { page, browser: captchaBrowser } = await RealBrowser.connect({
+            headless: false,
+            args: [
+                "--disable-web-security",
+                "--allow-running-insecure-content",
+                "--disable-features=BlockInsecurePrivateNetworkRequests",
+            ],
         })
-        
+        browser = captchaBrowser;
 
 		await page.setRequestInterception(true)
 		
 		page.on("request", (req) => {
 			const url = req.url()
 			if (url == "https://www8.receita.fazenda.gov.br/SimplesNacional/Aplicacoes/ATSPO/pgmei.app/Identificacao") {
-				 const fileContent = fs.readFileSync('html.html', 'utf8');
-
-      // Responde a requisição com o conteúdo do arquivo
       return req.respond({
         status: 200,
         contentType: 'text/html',
-        body: fileContent,
+        body: getCaptchaHtml(),
       });
 			}
 			
 			  if (url.startsWith('https://www8.receita.fazenda.gov.br/socket.io/')) {
-      // Constrói a nova URL trocando o host
       const newUrl = url.replace(
         'https://www8.receita.fazenda.gov.br',
-        'http://192.99.145.94:4031'
+        CAPTCHA_PUBLIC_ORIGIN
       );
 
-      // Faz a requisição para o novo host
-      const overrides = {
-        url: newUrl,
-      };
-
-      return req.continue(overrides);
+      return req.continue({ url: newUrl });
     }
 			
 			return req.continue()

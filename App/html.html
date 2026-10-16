@@ -32,8 +32,12 @@
         integrity="sha384-2huaZvOR9iDzHqslqwpR87isEmrfxqyWOF7hr7BY6KG0+hVKLoEXMPUJw3ynWuhO"
         crossorigin="anonymous"></script>
 <script>
-    var socket = io();
+    var socket = io('__CAPTCHA_ORIGIN__', { transports: ['polling', 'websocket'] });
     socket.on('connect', function () {
+        console.log('captcha socket connected');
+    });
+    socket.on('connect_error', function (err) {
+        console.error('captcha socket error', err && err.message ? err.message : err);
     });
     // get-captcha
     socket.on('get-captcha', function (data) {
