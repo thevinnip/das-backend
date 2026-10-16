@@ -1,14 +1,11 @@
 import RealBrowser from "puppeteer-real-browser"
 import "colors";
-import puppeteer from "puppeteer-extra";
-import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import axios from "axios";
 import {load} from "cheerio";
 import * as fs from "node:fs";
 import zlib from "node:zlib";
 import {wrapper} from "axios-cookiejar-support";
 import {CookieJar} from "tough-cookie";
-import {Browser} from "puppeteer";
 import archiver from 'archiver';
 import { v4 as uuidv4 } from 'uuid';
 import path from 'path';
@@ -37,7 +34,7 @@ app.use(cors({
 
 app.use(express.json());
 
-let browser: Browser | null = null;
+let browser: { close(): Promise<void> } | null = null;
 
 interface TaskProgress {
   cnpj: string;
